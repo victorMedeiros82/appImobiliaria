@@ -1,0 +1,91 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(resourceData) {
+      return isSignedIn() && resourceData.ownerId == request.auth.uid;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Validation for Contracts
+    function isValidContract(data) {
+      return data.tenantName is string && data.tenantName.size() <= 100 &&
+             data.rentValue is number && data.rentValue > 0 &&
+             data.ownerId == request.auth.uid &&
+             data.status in ['active', 'terminated', 'expired'];
+    }
+
+    // Validation for Payments
+    function isValidPayment(data) {
+      return data.contractId is string && data.contractId.size() <= 128 &&
+             data.value is number && data.value > 0 &&
+             data.status in ['pending', 'paid', 'overdue'] &&
+             data.ownerId == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------
+    // Contracts Collection
+    match /contracts/{contractId} {
+      allow get: if isOwner(resource.data) && isValidId(contractId);
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      
+      allow create: if isSignedIn() && 
+                      isValidContract(request.resource.data) && 
+                      isValidId(contractId);
+      
+      allow update: if isOwner(resource.data) && 
+                      isValidContract(request.resource.data) &&
+                      request.resource.data.ownerId == resource.data.ownerId &&
+                      (
+                        // Allow updating basic fields if active
+                        (resource.data.status == 'active' && 
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['tenantName', 'propertyAddress', 'rentValue', 'status', 'nextReadjustmentDate']))
+                      );
+      
+      allow delete: if isOwner(resource.data) && resource.data.status != 'active';
+    }
+
+    // Payments Collection
+    match /payments/{paymentId} {
+      allow get: if isOwner(resource.data) && isValidId(paymentId);
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      
+      allow create: if isSignedIn() && 
+                      isValidPayment(request.resource.data) && 
+                      isValidId(paymentId) &&
+                      get(/databases/$(database)/documents/contracts/$(request.resource.data.contractId)).data.ownerId == request.auth.uid;
+      
+      allow update: if isOwner(resource.data) && 
+                      isValidPayment(request.resource.data) &&
+                      (
+                        // Action: Mark as Paid (Webhook simulation logic)
+                        (resource.data.status == 'pending' && 
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'paymentDate', 'paymentMethod']))
+                      );
+    }
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId);
+      allow create: if isSignedIn() && (request.auth.uid == userId) && 
+                      request.resource.data.keys().hasAll(['email']) &&
+                      !( 'role' in request.resource.data); // Prevent self-assigning roles
+      allow update: if isSignedIn() && (request.auth.uid == userId) && 
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+    }
+  }
+}
